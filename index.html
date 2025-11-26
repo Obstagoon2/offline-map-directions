@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Offline & Online Map with Directions</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine/dist/leaflet-routing-machine.css" />
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    .modal {
+      position: fixed; z-index: 1000; left: 0; top: 0;
+      width: 100vw; height: 100vh;
+      background: rgba(0, 0, 0, 0.60);
+      display: flex; align-items: center; justify-content: center;
+    }
+    .modal-content {
+      background: white; padding: 2em; border-radius: 10px; text-align: center;
+      max-width: 400px;
+    }
+    button { margin: .5em; padding: .6em 1.1em; }
+    #status {
+      position: absolute; top: 10px; left: 10px;
+      background: rgba(255,255,255,0.9); padding: 8px 16px; border-radius: 8px;
+      z-index: 800;
+      font-size: 1em;
+    }
+  </style>
+</head>
+<body>
+  <div id="download-modal" class="modal" style="display:none;">
+    <div class="modal-content">
+      <h2>Download Offline Map?</h2>
+      <p>
+        This will store map tiles for 50 miles (~80 km) radius around your current location for offline viewing.<br>
+        Directions work while online.
+      </p>
+      <button id="download-yes">Yes, download</button>
+      <button id="download-no">No, just online</button>
+    </div>
+  </div>
+  <div id="status" style="display:none;"></div>
+  <div id="map"></div>
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-routing-machine/dist/leaflet-routing-machine.min.js"></script>
+  <script>
+    // Ask on first visit
+    document.addEventListener('DOMContentLoaded', () => {
+      if (!localStorage.getItem('offlineMapsChoice')) {
+        document.getElementById('download-modal').style.display = 'flex';
+      }
+    });
+
+    document.getElementById('download-yes').onclick = () => {
+      localStorage.setItem('offlineMapsChoice','yes');
+      document.getElementById('download-modal').style.display = 'none';
+      registerSWAndLoad(true);
+    };
+
+    document.getElementById('download-no').onclick = () => {
+      localStorage.setItem('offlineMapsChoice','no');
+      document.getElementById('download-modal').style.display = 'none';
+      registerSWAndLoad(false);
+    };
+
+    function registerSWAndLoad(enableOffline) {
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('sw.js').then(reg => {
+          if (reg.active && enableOffline) {
+            reg.active.postMessage({type:'offline'});
+          }
+        });
+      }
+      loadMap(enableOffline);
+    }
+
+    // Helper for miles to degrees
+    function milesToDegrees(miles) {
+      // Rough conversion at mid-latitude
+      return miles / 69;
+    }
+
+    // Map loader
+    function loadMap(offlineEnabled) {
+      let map = L.map('map').setView([39.5,-98.0], 5); // fallback US center
+      let tileLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+         maxZoom: 17,
+         attribution: '&copy; OpenStreetMap contributors'
+      }).addTo(map);
+
+      // Routing (online only)
+      let router = L.Routing.control({
+        waypoints: [],
+        routeWhileDragging: true,
+        geocoder: L.Control.Geocoder && L.Control.Geocoder.nominatim(),
+        router: L.Routing.osrmv1({serviceUrl: 'https://router.project-osrm.org/route/v1'}),
+        //hide auto
+      }).addTo(map);
+
+      // Geolocate for centering
+      if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(pos => {
+           let lat = pos.coords.latitude, lng = pos.coords.longitude;
+           map.setView([lat, lng], 13);
+
+           // Precache
+           if (offlineEnabled) {
+             precacheTiles(lat, lng, 50, map);
+           }
+        }, () => {
+           if (offlineEnabled) {
+              // If failed, why not precache somewhere generic?
+              precacheTiles(39.5, -98.0, 50, map);
+           }
+        });
+      } else if (offlineEnabled) {
+        precacheTiles(39.5, -98.0, 50, map);
+      }
+
+      // Allow click-to-route
+      let clickPoints = [];
+      map.on('click', e => {
+        clickPoints.push(e.latlng);
+        if(clickPoints.length === 2) {
+           router.setWaypoints(clickPoints);
+           clickPoints = [];
+        }
+      });
+    }
+
+    // Precache all map tiles for a radius from latlng
+    async function precacheTiles(lat, lng, miles, map) {
+      let degrees = milesToDegrees(miles);
+      let bounds = [
+         [lat - degrees, lng - degrees],
+         [lat + degrees, lng + degrees]
+      ];
+      let minZoom = 12, maxZoom = 16;
+      let tiles = tileUrlsInBounds(bounds, minZoom, maxZoom);
+      showStatus(`Downloading offline map (${tiles.length} tiles)...`);
+      // Request the SW cache each tile URL
+      if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+        for (const url of tiles) {
+          navigator.serviceWorker.controller.postMessage({type: 'cache-tile', url});
+        }
+      }
+      // Optional: fly to area & load tiles into view
+      if(map) {
+         map.flyTo([lat, lng], 13);
+      }
+      showStatus(`Downloading complete! You can now use these tiles offline.`, 5000);
+    }
+
+    // Build tile URLs (x, y, z) covering bounds
+    function tileUrlsInBounds(bounds, minZoom, maxZoom) {
+      let urls = [];
+      for(let z = minZoom; z <= maxZoom; z++) {
+        // At each zoom level, convert lat/lng bounds to tile x/y bounds
+        let [south, west] = bounds[0], [north, east] = bounds[1];
+        let [xMin, yMax] = latLngToTile(west, south, z);
+        let [xMax, yMin] = latLngToTile(east, north, z);
+        for(let x = Math.min(xMin, xMax); x <= Math.max(xMin, xMax); x++) {
+          for(let y = Math.min(yMin, yMax); y <= Math.max(yMin, yMax); y++) {
+            // s = ['a','b','c'] (per OSM); randomize for load balancing
+            let sub = ['a','b','c'][Math.floor(Math.random()*3)];
+            urls.push(`https://${sub}.tile.openstreetmap.org/${z}/${x}/${y}.png`);
+          }
+        }
+      }
+      return urls;
+    }
+
+    // OSM XYZ tiling helpers
+    function latLngToTile(lon, lat, zoom) {
+      // Lat/lon to OSM tile coordinates
+      let x = Math.floor( ( (lon + 180) / 360 ) * Math.pow(2, zoom) );
+      let y = Math.floor(
+        (1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * Math.pow(2, zoom)
+      );
+      return [x, y];
+    }
+
+    function showStatus(txt, timeoutMs) {
+      let status = document.getElementById('status');
+      status.innerText = txt;
+      status.style.display = 'block';
+      if (timeoutMs) setTimeout(()=>{ status.style.display = 'none'; },timeoutMs);
+    }
+
+    // If user already made a choice, skip modal
+    if (localStorage.getItem('offlineMapsChoice')) {
+      registerSWAndLoad(localStorage.getItem('offlineMapsChoice') === 'yes');
+    }
+  </script>
+</body>
+</html>
